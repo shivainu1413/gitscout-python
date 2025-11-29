@@ -5,15 +5,20 @@ import httpx
 import json
 import os
 from datetime import datetime
+import threading
+import time
+import asyncio
 
 CONFIG_PATH = "config.json"
 GITHUB_API_URL = "https://api.github.com/search/issues"
 
 
+# ====== Models ======
+
 class SearchConfig(BaseModel):
     organizations: List[str] = []    # org 或 user 名稱
     languages: List[str] = []        # python, typescript ...
-    polling_interval: int = 120      # 秒（給前端顯示用，實際頻率給 Cron 控制即可）
+    polling_interval: int = 120      # 秒（背景 worker 的輪詢間隔）
 
 
 class NotificationConfig(BaseModel):
@@ -25,7 +30,10 @@ class AppConfig(BaseModel):
     notif: NotificationConfig
     is_active: bool = False
     known_issue_ids: Set[int] = set()
+    last_items: List[Dict[str, Any]] = []  # 最近一次抓到的 issues
 
+
+# ====== Config 讀寫 ======
 
 def load_config() -> AppConfig:
     if not os.path.exists(CONFIG_PATH):
@@ -34,25 +42,28 @@ def load_config() -> AppConfig:
             search=SearchConfig(),
             notif=NotificationConfig(),
             is_active=False,
-            known_issue_ids=set()
+            known_issue_ids=set(),
+            last_items=[]
         )
         save_config(default)
         return default
 
     with open(CONFIG_PATH, "r") as f:
         raw = json.load(f)
-    # known_issue_ids 要轉回 set
+
     raw["known_issue_ids"] = set(raw.get("known_issue_ids", []))
+    raw["last_items"] = raw.get("last_items", [])
     return AppConfig(**raw)
 
 
 def save_config(cfg: AppConfig) -> None:
     data = cfg.dict()
-    # set 不能直接 json，要轉 list
-    data["known_issue_ids"] = list(cfg.known_issue_ids)
+    data["known_issue_ids"] = list(cfg.known_issue_ids)  # set 轉 list
     with open(CONFIG_PATH, "w") as f:
         json.dump(data, f, indent=2)
 
+
+# ====== App & 全域 config ======
 
 app = FastAPI()
 config = load_config()
@@ -62,6 +73,8 @@ class UpdateConfigRequest(BaseModel):
     search: SearchConfig
     notif: NotificationConfig
 
+
+# ====== API ======
 
 @app.get("/health")
 def health():
@@ -93,13 +106,23 @@ def stop_watch():
     return {"message": "watch stopped"}
 
 
+@app.get("/issues")
+def get_issues():
+    """
+    回傳最近一次 worker / 手動檢查時抓到的 issues。
+    """
+    cfg = load_config()
+    return {"items": cfg.last_items}
+
+
+# ====== GitHub & Discord 邏輯 ======
+
 async def fetch_github_issues(cfg: AppConfig) -> List[Dict[str, Any]]:
     # 組 query：org/user + language + good first issue
-    parts = []
+    parts: List[str] = []
 
     # org/user
     for name in cfg.search.organizations:
-        # 你可以自行決定是 org 還是 user，這裡簡單當作 org:user 都試著查
         parts.append(f"org:{name}")
         parts.append(f"user:{name}")
 
@@ -140,11 +163,12 @@ async def send_discord_webhook(webhook_url: str, issues: List[Dict[str, Any]]):
         repo_full_name = issue.get("repository_url", "").replace(
             "https://api.github.com/repos/", ""
         )
+        body = issue.get("body") or ""
         embeds.append(
             {
                 "title": issue.get("title"),
                 "url": issue.get("html_url"),
-                "description": f"Repo: {repo_full_name}\nState: {issue.get('state')}\n\n{(issue.get('body') or '')[:200]}...",
+                "description": f"Repo: {repo_full_name}\nState: {issue.get('state')}\n\n{body[:200]}...",
                 "color": 5814783,
                 "footer": {"text": "GitScout Notification"},
             }
@@ -159,18 +183,13 @@ async def send_discord_webhook(webhook_url: str, issues: List[Dict[str, Any]]):
         await client.post(webhook_url, json=payload, timeout=10.0)
 
 
-@app.get("/issues")
-def get_issues():
-    cfg = load_config()
-    return {"items": cfg.last_items}
+# ====== 核心檢查邏輯（worker & /cron 共用） ======
 
-
-@app.get("/cron/check")
-async def cron_check():
+async def run_check_once() -> Dict[str, Any]:
     """
-    給 Render Cron Job 呼叫：
-    - 若 is_active=False 直接略過
-    - 否則查 GitHub，找出新 issue，發 Discord，更新 known_issue_ids
+    只做一次 GitHub 檢查：
+    - 若未啟用 watch，直接略過
+    - 否則抓 issues、判斷新 issue、更新 config、發 Discord
     """
     global config
 
@@ -191,15 +210,63 @@ async def cron_check():
             config.known_issue_ids.add(iid)
             new_issues.append(it)
 
-    # 存回已知 ID
+    # 更新最後一次抓到的清單
+    config.last_items = items
     save_config(config)
 
     # 發 Discord
     if new_issues and config.notif.webhook_url:
         await send_discord_webhook(config.notif.webhook_url, new_issues)
 
-    return {
+    result = {
         "checked_at": datetime.utcnow().isoformat() + "Z",
         "fetched": len(items),
         "new": len(new_issues),
     }
+    print("run_check_once result:", result)
+    return result
+
+
+@app.get("/cron/check")
+async def cron_check():
+    """
+    仍然保留這個 endpoint，方便你手動觸發或本機測試。
+    """
+    return await run_check_once()
+
+
+# ====== 背景 worker thread ======
+
+def background_worker():
+    global config
+    print("Background worker started")
+    while True:
+        try:
+            # 每輪讀一次最新 config（避免只用記憶體版本）
+            cfg = load_config()
+            # 更新 global config 參考
+            config.search = cfg.search
+            config.notif = cfg.notif
+            config.is_active = cfg.is_active
+            config.known_issue_ids = cfg.known_issue_ids
+            config.last_items = cfg.last_items
+
+            interval = max(cfg.search.polling_interval, 30)  # 最少 30 秒
+            if cfg.is_active:
+                # 用 asyncio.run 執行一次檢查
+                asyncio.run(run_check_once())
+            else:
+                print("watch inactive, worker idle")
+
+            time.sleep(interval)
+        except Exception as e:
+            print("background worker error:", e)
+            # 避免狂刷 log，出錯時暫停一段時間
+            time.sleep(30)
+
+
+@app.on_event("startup")
+def start_background_worker():
+    t = threading.Thread(target=background_worker, daemon=True)
+    t.start()
+    print("Background worker thread launched")
